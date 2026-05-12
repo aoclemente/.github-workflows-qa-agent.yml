@@ -1,0 +1,170 @@
+name: QA Agent
+
+# ============================================================
+# STEP 2 — TRIGGER
+# WHERE:  Top of the file, under `on:`
+# OUTCOME: Workflow runs automatically whenever a PR is opened
+#          or new commits are pushed to an existing PR
+# ============================================================
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  qa-agent:
+    runs-on: ubuntu-latest
+
+    # STEP 3 — PERMISSIONS
+    # WHERE:  Under `jobs.qa-agent`
+    # OUTCOME: GitHub grants the workflow access to read code,
+    #          write PR comments, and call GitHub Models API
+    permissions:
+      contents: read
+      pull-requests: write
+      models: read
+
+    steps:
+
+      # ============================================================
+      # STEP 2 (continued) — CHECKOUT
+      # WHERE:  First step inside `steps:`
+      # OUTCOME: The runner downloads your repo code so the
+      #          workflow can read files and compute the diff
+      # ============================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ============================================================
+      # STEP 2 (continued) — GET DIFF
+      # WHERE:  Second step inside `steps:`
+      # OUTCOME: Produces a file `diff_trimmed.txt` containing
+      #          only the code that changed in this PR (max 8000
+      #          chars to stay within AI token limits)
+      # ============================================================
+      - name: Get diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > diff.txt
+          head -c 8000 diff.txt > diff_trimmed.txt
+
+      # ============================================================
+      # STEP 2 — RUN QA AGENT VIA GITHUB MODELS
+      # WHERE:  Third step inside `steps:`
+      # OUTCOME: Sends the diff to GitHub-hosted GPT-4o model.
+      #          No external API key needed — uses GITHUB_TOKEN.
+      #          Produces `qa_results.md` with:
+      #            - AI-generated test cases
+      #            - Edge cases
+      #            - Risk flags for the reviewer
+      # ============================================================
+      - name: Run QA Agent via GitHub Models
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DIFF=$(cat diff_trimmed.txt)
+
+          curl -s https://models.inference.ai.azure.com/chat/completions \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"gpt-4o\",
+              \"messages\": [
+                {
+                  \"role\": \"system\",
+                  \"content\": \"You are a QA engineer. Analyze code diffs and generate test cases, edge cases, and flag risks. Return executable Pytest code only.\"
+                },
+                {
+                  \"role\": \"user\",
+                  \"content\": \"Review this PR diff and generate QA test cases:\n\n$(cat diff_trimmed.txt)\"
+                }
+              ]
+            }" | jq -r '.choices[0].message.content' > qa_results.md
+
+      # ============================================================
+      # STEP 4 — INSTALL AND RUN GENERATED TESTS
+      # WHERE:  RIGHT AFTER the QA Agent step, BEFORE posting results
+      # OUTCOME: Actually executes the AI-generated tests using
+      #          Pytest. Results saved to `test_run.txt`.
+      #          The `|| true` means the workflow won't stop here
+      #          even if some tests fail — failures are reported
+      #          in the PR comment instead
+      # ============================================================
+      - name: Install and run generated tests
+        run: |
+          pip install pytest
+          pytest qa_results/ -v --tb=short > test_run.txt 2>&1 || true
+
+      # ============================================================
+      # STEP 4 (continued) — APPEND TEST RESULTS
+      # WHERE:  Immediately after the test runner step
+      # OUTCOME: Merges the live test output into qa_results.md
+      #          so the PR comment shows both AI suggestions AND
+      #          actual pass/fail results in one place
+      # ============================================================
+      - name: Post test results
+        run: |
+          echo "\n\n---\n## ▶️ Test Run Output\n" >> qa_results.md
+          cat test_run.txt >> qa_results.md
+
+      # ============================================================
+      # STEP 2 (continued) — POST RESULTS TO PR
+      # WHERE:  After all test steps, near the end of `steps:`
+      # OUTCOME: Posts a comment on the PR containing:
+      #            - AI-generated test cases
+      #            - Edge cases and risks
+      #            - Actual test run results (pass/fail)
+      #          Visible to everyone on the PR immediately
+      # ============================================================
+      - name: Post results to PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const results = fs.readFileSync('qa_results.md', 'utf8');
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.data.find(c =>
+              c.user.type === 'Bot' && c.body.includes('QA Agent Report')
+            );
+
+            const body = `## 🧪 QA Agent Report\n\n${results}`;
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # ============================================================
+      # STEP 5 — QA GATE (pass/fail enforcement)
+      # WHERE:  Last step in `steps:`
+      # OUTCOME: Reads test_run.txt and checks for failures.
+      #          If any test FAILED → workflow exits with error,
+      #          PR is blocked from merging (red X on the check).
+      #          If all pass → green checkmark, PR can merge.
+      # ============================================================
+      - name: Enforce QA gate
+        run: |
+          if grep -q "FAILED" test_run.txt; then
+            echo "❌ QA Agent found failing tests — merge blocked"
+            exit 1
+          else
+            echo "✅ All QA checks passed — safe to merge"
+          fi
